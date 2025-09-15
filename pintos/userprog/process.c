@@ -23,7 +23,7 @@
 #endif
 
 static void process_cleanup(void);
-static bool load(const char *file_name, struct intr_frame *if_);
+static bool load(char *file_name, struct intr_frame *if_);
 static void initd(void *f_name);
 static void __do_fork(void *);
 
@@ -182,20 +182,6 @@ int process_exec(void *f_name)
 	process_cleanup();
 	/* And then load the binary */
 	success = load(file_name, &_if);
-	// (1) load() 직후, 성공 여부/레지스터 값 찍기
-	if (success)
-	{
-		printf("[exec] load ok: rip=%p rsp=%p\n", (void *)_if.rip, (void *)_if.rsp);
-	}
-	else
-	{
-		printf("[exec] load FAIL\n");
-	}
-	// (2) 유저 진입용 인자 레지스터 최소 세팅 (arg passing 없이 printf만)
-	_if.rsp -= 8;
-	*(uint64_t *)_if.rsp = 0;
-	_if.R.rdi = 0;		 // argc = 0
-	_if.R.rsi = _if.rsp; // argv = NULL
 
 	/* If load failed, quit. */
 	palloc_free_page(file_name);
@@ -203,8 +189,6 @@ int process_exec(void *f_name)
 		return -1;
 
 	/* Start switched process. */
-	// (3) 점프 직전에 '바로 전' 로그
-	printf("[exec] do_iret now\n");
 	do_iret(&_if);
 	NOT_REACHED();
 }
@@ -236,7 +220,7 @@ void process_exit(void)
 	 * TODO: Implement process termination message (see
 	 * TODO: project2/process_termination.html).
 	 * TODO: We recommend you to implement process resource cleanup here. */
-
+	printf("%s: exit(%d)\n", curr->name, curr->exit_status);
 	process_cleanup();
 }
 
@@ -341,12 +325,14 @@ static bool load_segment(struct file *file, off_t ofs, uint8_t *upage,
 						 uint32_t read_bytes, uint32_t zero_bytes,
 						 bool writable);
 
+#define MAX_ARGS 64
+
 /* Loads an ELF executable from FILE_NAME into the current thread.
  * Stores the executable's entry point into *RIP
  * and its initial stack pointer into *RSP.
  * Returns true if successful, false otherwise. */
 static bool
-load(const char *file_name, struct intr_frame *if_)
+load(char *file_name, struct intr_frame *if_)
 {
 	struct thread *t = thread_current();
 	struct ELF ehdr;
@@ -354,24 +340,49 @@ load(const char *file_name, struct intr_frame *if_)
 	off_t file_ofs;
 	bool success = false;
 	int i;
+
+	// file_name 파싱
+	char *token;
+	char *saveptr;
+	int argc = 0;
+	char *argv[MAX_ARGS];
+
+	for (token = strtok_r(file_name, " ", &saveptr); token != NULL; token = strtok_r(NULL, " ", &saveptr))
+	{
+		if (argc == MAX_ARGS)
+		{
+			goto done;
+		}
+		argv[argc] = token;
+		argc++;
+	}
+	argv[argc] = NULL;
+	if (argv[0] == NULL)
+	{
+		goto done;
+	}
+	const char *prog = argv[0];
+
 	/* Allocate and activate page directory. */
 	t->pml4 = pml4_create();
 	if (t->pml4 == NULL)
 		goto done;
 	process_activate(thread_current());
 	/* Open executable file. */
-	file = filesys_open(file_name);
+	file = filesys_open(prog);
 	if (file == NULL)
 	{
-		printf("load: %s: open failed\n", file_name);
+		printf("load: %s: open failed\n", prog);
 		goto done;
 	}
+	// 스레드 이름을 위에서 파싱한 실행 파일 이름으로 변경
+	strlcpy(t->name, prog, sizeof t->name);
 
 	/* Read and verify executable header. */
 	if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr || memcmp(ehdr.e_ident, "\177ELF\2\1\1", 7) || ehdr.e_type != 2 || ehdr.e_machine != 0x3E // amd64
 		|| ehdr.e_version != 1 || ehdr.e_phentsize != sizeof(struct Phdr) || ehdr.e_phnum > 1024)
 	{
-		printf("load: %s: error loading executable\n", file_name);
+		printf("load: %s: error loading executable\n", prog);
 		goto done;
 	}
 
@@ -437,7 +448,42 @@ load(const char *file_name, struct intr_frame *if_)
 	if (!setup_stack(if_))
 		goto done;
 	ASSERT(if_->rsp != 0);
-	hex_dump((uintptr_t)(if_->rsp - 32), (void *)(if_->rsp - 32), 32, true);
+
+	// 문자열(인자) 배열을 역순으로 유저 스택에 복사
+	uint8_t *sp = (uint8_t *)if_->rsp;
+	char *uaddr[MAX_ARGS];
+	for (int i = argc - 1; i >= 0; i--)
+	{
+		char *arg = argv[i];
+		size_t len = strlen(arg);
+
+		// (각 문자열 길이 + 널 문자)만큼 스택에 공간 확보 및 복사
+		sp -= (len + 1);
+		uaddr[i] = (char *)sp;
+		// 복사 후 sp값이 곧 해당 문자열이 시작된 주소가 됨
+		memcpy(sp, arg, len + 1);
+	}
+
+	// 8바이트 정렬
+	// ~0x7ULL은 하위 3비트가 0인 64비트 정수 => 이진수로는 ...1111 1000
+
+	sp = (uint8_t *)((uintptr_t)sp & ~0x7ULL);
+
+	// 포인터 배열(유저 영역)
+	sp -= 8;
+	*(uint64_t *)sp = 0; // argv[argc] == NULL
+	for (i = argc - 1; i >= 0; i--)
+	{
+		sp -= 8;
+		*(uint64_t *)sp = (uint64_t)uaddr[i];
+	}
+	void *argv_user = sp;
+
+	if_->R.rdi = argc;
+	if_->R.rsi = (uint64_t)argv_user;
+	if_->rsp = (uint64_t)sp;
+	if_->rip = ehdr.e_entry;
+
 	/* Start address. */
 	if_->rip = ehdr.e_entry;
 

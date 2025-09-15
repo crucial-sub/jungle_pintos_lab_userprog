@@ -11,6 +11,9 @@
 
 void syscall_entry(void);
 void syscall_handler(struct intr_frame *);
+static void sys_exit(struct intr_frame *f);
+static void sys_write(struct intr_frame *f);
+static void sys_badcall(struct intr_frame *f);
 
 /* System call.
  *
@@ -38,6 +41,59 @@ void syscall_init(void)
 			  FLAG_IF | FLAG_TF | FLAG_DF | FLAG_IOPL | FLAG_AC | FLAG_NT);
 }
 
+/* syscall_handler lookup 테이블 방식 구현
+ * syscall-nr.h 파일에 정의된 시스템 콜 번호에 대응하는 함수 포인터들을 배열로 미리 마련해둠
+ * 시스템 콜이 발생하면 f->R.rax 값을 인덱스로 삼아 해당하는 함수를 바로 호출 */
+typedef void (*syscall_handler_t)(struct intr_frame *f); // 함수 포인터 형 재선언
+
+static const syscall_handler_t syscall_tbl[] = {
+	NULL,	   // SYS_HALT
+	sys_exit,  // SYS_EXIT
+	NULL,	   // SYS_FORK
+	NULL,	   // SYS_EXEC
+	NULL,	   // SYS_WAIT
+	NULL,	   // SYS_CREATE
+	NULL,	   // SYS_REMOVE
+	NULL,	   // SYS_OPEN
+	NULL,	   // SYS_FILESIZE
+	NULL,	   // SYS_READ
+	sys_write, // SYS_WRITE
+	NULL,	   // SYS_SEEK
+	NULL,	   // SYS_TELL
+	NULL,	   // SYS_CLOSE
+};
+
+static void sys_exit(struct intr_frame *f)
+{
+	int status = (int)f->R.rdi;
+	struct thread *curr = thread_current();
+	curr->exit_status = status;
+	thread_exit();
+}
+
+static void sys_write(struct intr_frame *f)
+{
+	int fd = (int)f->R.rdi;
+	const char *buf = (const char *)f->R.rsi;
+	size_t size = (size_t)f->R.rdx;
+
+	if (fd == 1)
+	{
+		putbuf(buf, size);
+		f->R.rax = size;
+	}
+	else
+	{
+		f->R.rax = (uint64_t)-1;
+	}
+}
+
+static void sys_badcall(struct intr_frame *f)
+{
+	f->R.rdi = (uint64_t)-1;
+	sys_exit(f);
+}
+
 /* The main system call interface
  * Pintos에서는 사용자 프로그램이 시스템 콜을 할 때 syscall을 사용
  * 시스템 콜 번호와 추가 인자들은 syscall 명령어를 호출하기 전에 일반적인 방식으로 레지스터에 저장되어야 하지만, 두 가지 예외가 있다.
@@ -45,31 +101,14 @@ void syscall_init(void)
  * 2. 네 번째 인자는 %rcx가 아니라 %r10에 저장
  * 따라서 시스템 콜 핸들러인 syscall_handler()가 제어권을 넘겨받으면, 시스템 콜 번호는 rax에 있고,
  * 인자들은 %rdi, %rsi, %rdx, %r10, %r8, %r9 순서로 전달됨 (6개 이상 부터는 스택에 저장) */
-void syscall_handler(struct intr_frame *f UNUSED)
+void syscall_handler(struct intr_frame *f)
 {
-	// TODO: Your implementation goes here.
-	if (f->R.rax == SYS_WRITE)
+	uint64_t n = f->R.rax;
+
+	if (n >= (sizeof(syscall_tbl) / sizeof(syscall_tbl[0])) || syscall_tbl[n] == NULL)
 	{
-		int fd = (int)f->R.rdi;
-		const void *buf = (const void *)f->R.rsi;
-		unsigned size = (unsigned)f->R.rdx;
-		if (fd == 1)
-		{
-			putbuf(buf, size);
-
-			f->R.rax = size;
-			return;
-		}
-
-		// 그 외 fd는 아직 미구현: 실패 반환
-		f->R.rax = -1;
+		sys_badcall(f);
 		return;
 	}
-	if (f->R.rax == SYS_EXIT)
-	{
-		int status = (int)f->R.rdi;
-		printf("%s: exit(%d)\n", thread_current()->name, status);
-		process_exit();
-		thread_exit();
-	}
+	syscall_tbl[n](f);
 }
