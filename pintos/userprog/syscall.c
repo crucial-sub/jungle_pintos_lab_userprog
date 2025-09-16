@@ -22,6 +22,7 @@ static void sys_exit(struct intr_frame *f);
 static void sys_write(struct intr_frame *f);
 static void sys_create(struct intr_frame *f);
 static void sys_open(struct intr_frame *f);
+static void sys_close(struct intr_frame *f);
 static void sys_badcall(struct intr_frame *f);
 
 /* System call.
@@ -155,6 +156,38 @@ int fd_allocate(struct file *f)
 	return -1; // fd테이블이 가득 참
 }
 
+// fd->file* 변환: read/write/close 같은 시스템콜은 FD를 받아오니까, 역으로 file* 를 찾아야 함
+struct file *fd_get(int fd)
+{
+	struct thread *t = thread_current();
+	if (fd < 0 || fd >= FD_MAX)
+		return NULL;
+	return t->fd_table[fd];
+}
+
+// fd 해제: fd_table에 번호 반납하고 실제 파일도 close
+void fd_close(int fd)
+{
+	struct thread *t = thread_current();
+	if (fd < 0 || fd >= FD_MAX)
+		return;
+	if (t->fd_table[fd])
+	{
+		file_close(t->fd_table[fd]);
+		t->fd_table[fd] = NULL;
+	}
+}
+
+void fd_close_all()
+{
+	struct thread *t = thread_current();
+	for (int i = 2; i < FD_MAX; i++)
+	{
+		fd_close(i);
+	}
+	t->fd_next = 2;
+}
+
 void syscall_init(void)
 {
 	write_msr(MSR_STAR, ((uint64_t)SEL_UCSEG - 0x10) << 48 |
@@ -187,7 +220,7 @@ static const syscall_handler_t syscall_tbl[] = {
 	sys_write,	// SYS_WRITE
 	NULL,		// SYS_SEEK
 	NULL,		// SYS_TELL
-	NULL,		// SYS_CLOSE
+	sys_close,	// SYS_CLOSE
 };
 
 static void sys_exit(struct intr_frame *f)
@@ -282,6 +315,14 @@ static void sys_open(struct intr_frame *f)
 
 	free(name_k);
 }
+
+static void sys_close(struct intr_frame *f)
+{
+	int fd = (int)f->R.rdi;
+
+	fd_close(fd);
+}
+
 void syscall_handler(struct intr_frame *f)
 {
 	// 시스템 콜 번호
