@@ -7,6 +7,10 @@
     "string_view": "c",
     "interrupt.h": "c",
     "__availability": "c",
-    "thread.h": "c"
+    "thread.h": "c",
+    "stdio.h": "c",
+    "filesys.h": "c",
+    "memory": "c",
+    "atomic": "c"
   }
 }

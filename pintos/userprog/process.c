@@ -208,7 +208,10 @@ int process_wait(tid_t child_tid UNUSED)
 	 * XXX:       to add infinite loop here before
 	 * XXX:       implementing the process_wait. */
 	for (int i = 0; i < 1000; i++)
+	{
 		thread_yield();
+	}
+
 	return -1;
 }
 
@@ -477,18 +480,21 @@ load(char *file_name, struct intr_frame *if_)
 		sp -= 8;
 		*(uint64_t *)sp = (uint64_t)uaddr[i];
 	}
+	// 스택에 쌓아둔 argv[0] 포인터가 놓인 "argv 배열의 시작 주소"
 	void *argv_user = sp;
 
+	// 유저 프로그램의 진입점인 _start(argc, argv) 함수에 인자를 제대로 전달해주기 위해
+	// 첫 번째 인자 argc는 rdi에, 두 번째 인자 argv(argv 배열의 시작 주소)는 rsi에 담아줘야 한다!
 	if_->R.rdi = argc;
 	if_->R.rsi = (uint64_t)argv_user;
+
+	// 가짜 주소
+	sp -= 8;
+	*(uint64_t *)sp = 0;
+
+	// 유저 스택 최상단과 유저 프로그램 시작 주소(ELF의 e_entry, 보통 _start) 지정
 	if_->rsp = (uint64_t)sp;
 	if_->rip = ehdr.e_entry;
-
-	/* Start address. */
-	if_->rip = ehdr.e_entry;
-
-	/* TODO: Your code goes here.
-	 * TODO: Implement argument passing (see project2/argument_passing.html). */
 
 	success = true;
 
