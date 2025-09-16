@@ -28,6 +28,9 @@ typedef int tid_t;
 #define PRI_DEFAULT 31 /* Default priority. */
 #define PRI_MAX 63	   /* Highest priority. */
 
+struct file;
+#define FD_MAX 128
+
 /* A kernel thread or user process.
  *
  * Each thread structure is stored in its own 4 kB page.  The
@@ -92,7 +95,6 @@ struct thread
 	enum thread_status status; /* Thread state. */
 	char name[16];			   /* Name (for debugging purposes). */
 	int priority;			   /* Priority. */
-
 	/* Shared between thread.c and synch.c. */
 	struct list_elem elem; /* List element. */
 
@@ -100,6 +102,10 @@ struct thread
 	/* Owned by userprog/process.c. */
 	uint64_t *pml4; /* Page map level 4 */
 	int exit_status;
+
+	/* 프로세스 별 FD테이블 추가 */
+	struct file *fd_table[FD_MAX]; // 열린 파일들의 포인터 저장
+	int fd_next;				   // 다음에 할당할 FD 번호
 #endif
 #ifdef VM
 	/* Table for whole virtual memory owned by thread. */

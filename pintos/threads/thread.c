@@ -449,6 +449,11 @@ init_thread(struct thread *t, const char *name, int priority)
 
 #ifdef USERPROG
 	t->exit_status = -1;
+
+	/* FD table init: 한 번만 */
+	t->fd_next = 2; /* 0=stdin, 1=stdout 예약 */
+	for (int i = 0; i < FD_MAX; i++)
+		t->fd_table[i] = NULL;
 #endif
 }
 

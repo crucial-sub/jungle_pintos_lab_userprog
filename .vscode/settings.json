@@ -11,6 +11,8 @@
     "stdio.h": "c",
     "filesys.h": "c",
     "memory": "c",
-    "atomic": "c"
+    "atomic": "c",
+    "intrinsic.h": "c",
+    "typeinfo": "c"
   }
 }

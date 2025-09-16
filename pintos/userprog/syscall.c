@@ -14,12 +14,14 @@
 #include "threads/palloc.h"
 #include "threads/malloc.h"
 #include "filesys/filesys.h"
+#include "filesys/file.h"
 
 void syscall_entry(void);
 void syscall_handler(struct intr_frame *);
 static void sys_exit(struct intr_frame *f);
 static void sys_write(struct intr_frame *f);
 static void sys_create(struct intr_frame *f);
+static void sys_open(struct intr_frame *f);
 static void sys_badcall(struct intr_frame *f);
 
 /* System call.
@@ -123,6 +125,36 @@ copy_in_string_k(const char *ustr, size_t maxlen, bool *too_long)
 	return buf;
 }
 
+/* fd 헬퍼 */
+// fd테이블에서 빈 번호 찾아서 파일에 fd할당
+int fd_allocate(struct file *f)
+{
+	struct thread *t = thread_current();
+	int start = t->fd_next; // 다음 후보 시작점
+	if (start < 2 || start >= FD_MAX)
+	{
+		start = 2;
+	}
+
+	/* 1) start..FD_MAX-1, 2) 2..start-1 순서로 한 바퀴만 돈다 */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		int i = (pass == 0 ? start : 2);
+		int end = (pass == 0 ? FD_MAX : start);
+
+		for (; i < end; i++)
+		{
+			if (t->fd_table[i] == NULL)
+			{
+				t->fd_table[i] = f;
+				t->fd_next = (i + 1 < FD_MAX ? i + 1 : 2); // 다음 탐색 힌트
+				return i;								   // FD = 인덱스
+			}
+		}
+	}
+	return -1; // fd테이블이 가득 참
+}
+
 void syscall_init(void)
 {
 	write_msr(MSR_STAR, ((uint64_t)SEL_UCSEG - 0x10) << 48 |
@@ -149,7 +181,7 @@ static const syscall_handler_t syscall_tbl[] = {
 	NULL,		// SYS_WAIT
 	sys_create, // SYS_CREATE
 	NULL,		// SYS_REMOVE
-	NULL,	   // SYS_OPEN
+	sys_open,	// SYS_OPEN
 	NULL,		// SYS_FILESIZE
 	NULL,		// SYS_READ
 	sys_write,	// SYS_WRITE
@@ -221,13 +253,35 @@ static void sys_create(struct intr_frame *f)
 	free(name_k);
 }
 
-/* The main system call interface
- * Pintos에서는 사용자 프로그램이 시스템 콜을 할 때 syscall을 사용
- * 시스템 콜 번호와 추가 인자들은 syscall 명령어를 호출하기 전에 일반적인 방식으로 레지스터에 저장되어야 하지만, 두 가지 예외가 있다.
- * 1. %rax에는 시스템 콜 번호가 저장
- * 2. 네 번째 인자는 %rcx가 아니라 %r10에 저장
- * 따라서 시스템 콜 핸들러인 syscall_handler()가 제어권을 넘겨받으면, 시스템 콜 번호는 rax에 있고,
- * 인자들은 %rdi, %rsi, %rdx, %r10, %r8, %r9 순서로 전달됨 (6개 이상 부터는 스택에 저장) */
+static void sys_open(struct intr_frame *f)
+{
+	const char *file_u = (const char *)f->R.rdi;
+	bool too_long = false;
+	char *name_k = copy_in_string_k(file_u, NAME_MAX, &too_long);
+
+	if (too_long)
+	{
+		f->R.rax = -1;
+	}
+	else if (name_k[0] == '\0')
+	{
+		f->R.rax = -1;
+	}
+	else
+	{
+		struct file *file = filesys_open(name_k);
+		if (file == NULL)
+		{
+			f->R.rax = -1;
+		}
+		else
+		{
+			f->R.rax = fd_allocate(file);
+		}
+	}
+
+	free(name_k);
+}
 void syscall_handler(struct intr_frame *f)
 {
 	// 시스템 콜 번호
