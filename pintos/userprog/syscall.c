@@ -141,6 +141,16 @@ static void *safe_copy_to_user(const char *user_dest, const char *kernel_src, si
 	}
 }
 
+static void *safe_copy_from_user(const char *kernel_dest, const char *user_src, size_t size)
+{
+	for (int i = 0; i < size; i++)
+	{
+		char byte_to_copy = user_src[i];
+		const char *current_kernel_addr = kernel_dest + i;
+		safe_write_u8(current_kernel_addr, byte_to_copy);
+	}
+}
+
 // 반환: 커널 힙에 새로 할당된 NUL-종료 문자열 (caller가 free)
 // too_long: 원본이 maxlen을 초과(= maxlen 내에 NUL 없음)했는지 신호
 char *copy_in_string_k(const char *ustr, size_t maxlen, bool *too_long)
@@ -290,28 +300,6 @@ static void sys_exit(struct intr_frame *f)
  * 따라서 시스템 콜 핸들러인 syscall_handler()가 제어권을 넘겨받으면, 시스템 콜 번호는 rax에 있고,
  * 인자들은 %rdi, %rsi, %rdx, %r10, %r8, %r9 순서로 전달됨 (6개 이상 부터는 스택에 저장)`
  */
-static void sys_write(struct intr_frame *f)
-{
-	int fd = (int)f->R.rdi;
-	const char *buf = (const char *)f->R.rsi;
-	size_t size = (size_t)f->R.rdx;
-	if (size == 0)
-	{
-		f->R.rax = 0;
-		return;
-	}
-
-	if (fd == 1)
-	{
-		putbuf(buf, size);
-		f->R.rax = size;
-	}
-	else
-	{
-		f->R.rax = (uint64_t)-1;
-	}
-}
-
 static void sys_badcall(struct intr_frame *f)
 {
 	f->R.rdi = (uint64_t)-1;
@@ -438,6 +426,56 @@ static void sys_filesize(struct intr_frame *f)
 		return;
 	}
 	f->R.rax = file_length(file);
+}
+
+static void sys_write(struct intr_frame *f)
+{
+	int fd = (int)f->R.rdi;
+	const char *buf = (const char *)f->R.rsi;
+	size_t size = (size_t)f->R.rdx;
+	if (size == 0)
+	{
+		f->R.rax = 0;
+		return;
+	}
+
+	check_valid_buffer(buf, size);
+
+	if (fd == 1)
+	{
+		putbuf(buf, size);
+		f->R.rax = size;
+		return;
+	}
+	if (fd == 0)
+	{
+		f->R.rax = -1;
+		return;
+	}
+	if (fd > 1)
+	{
+		struct file *file = fd_get(fd);
+		if (file == NULL)
+		{
+			f->R.rax = -1;
+			return;
+		}
+
+		char *ubuf = malloc(size);
+		if (ubuf == NULL)
+		{
+			f->R.rax = -1; // 메모리 부족
+			return;
+		}
+
+		off_t bytes_read = file_write(file, ubuf, size);
+
+		safe_copy_from_user(buf, ubuf, bytes_read);
+
+		// 5. 자원 해제 및 결과 반환
+		free(ubuf);
+		f->R.rax = bytes_read;
+	}
 }
 
 /* The main system call interface */
