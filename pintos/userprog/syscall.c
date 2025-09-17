@@ -23,7 +23,15 @@ static void sys_write(struct intr_frame *f);
 static void sys_create(struct intr_frame *f);
 static void sys_open(struct intr_frame *f);
 static void sys_close(struct intr_frame *f);
+static void sys_read(struct intr_frame *f);
+static void sys_filesize(struct intr_frame *f);
 static void sys_badcall(struct intr_frame *f);
+static void *get_validated_kaddr(const void *uaddr);
+static void check_valid_buffer(const void *buf, size_t size);
+static inline uint8_t safe_read_u8(const void *uaddr);
+static void safe_write_u8(const void *uaddr, uint8_t v);
+static void *safe_copy_to_user(const char *user_dest, const char *kernel_src, size_t size);
+char *copy_in_string_k(const char *ustr, size_t maxlen, bool *too_long);
 
 /* System call.
  *
@@ -41,8 +49,7 @@ static void sys_badcall(struct intr_frame *f);
 /* 유저 포인터 검증 실패를 즉시 종료로 처리해야 커널이 안전하며 테스트 요구사항을 만족한다.
  * => exit_bad_user(): 해당 프로세스만 깔끔하게 종료시키는 함수 */
 // __attribute__((noreturn)): 이 함수는 절대 리턴하지 않는다고 컴파일러에 선언
-static __attribute__((noreturn)) void
-exit_bad_user(void)
+static __attribute__((noreturn)) void exit_bad_user(void)
 {
 	struct thread *t = thread_current();
 	t->exit_status = -1; // exit(-1)
@@ -52,78 +59,122 @@ exit_bad_user(void)
 	__builtin_unreachable();
 }
 
-// uaddr에서 바이트 하나를 안전하게 읽기
-static inline uint8_t
-safe_read_u8(const void *uaddr)
+/*
+ * 주어진 유저 주소 uaddr의 유효성을 검사하고,
+ * 접근 가능한 커널 가상 주소를 반환한다.
+ * 유효하지 않은 주소일 경우, 프로세스를 종료시킨다.
+ */
+static void *get_validated_kaddr(const void *uaddr)
 {
-	// NULL이거나 커널 영역 주소(>= KERN_BASE)면 바로 해당 프로세스 종료
-	// is_user_vaddr는 주어진 가상주소가 유저 영역인지 판별
+	// 1. NULL 포인터이거나 커널 영역 주소이면 안 됨.
 	if (uaddr == NULL || !is_user_vaddr(uaddr))
 	{
 		exit_bad_user();
 	}
 
-	// 현재 스레드의 최상위 페이지 테이블(PML4)를 통해 uaddr가 매핑된 물리 프레임을 찾고,
-	// 그 프레임을 가리키는 커널 가상주소를 얻음. (매핑이 없으면 NULL)
+	// 2. 페이지 테이블을 확인하여 실제 물리 메모리에 매핑되어 있는지 확인.
 	void *kaddr = pml4_get_page(thread_current()->pml4, uaddr);
 	if (kaddr == NULL)
 	{
+		// 매핑되지 않은 주소라면 접근 불가.
 		exit_bad_user();
 	}
-	// 검증 끝난 커널 가상주소로부터 1바이트 안전 읽기
-	// 이걸 문자 단위 루프에서 쓰면, 문자열이 페이지 경계를 넘어도 각 바이트마다 독립적으로 검증되어 안전하게 동작한다.
-	return *(const uint8_t *)kaddr;
+
+	// 3. 모든 검증을 통과한 안전한 커널 주소를 반환.
+	return kaddr;
+}
+
+/*
+ * 주어진 유저 버퍼(buf, size)의 모든 페이지가 유효한지 검사한다.
+ * 유효하지 않은 페이지가 발견되면, get_validated_kaddr 내부에서
+ * 프로세스를 종료시키므로 이 함수는 반환하지 않는다.
+ */
+static void check_valid_buffer(const void *buf, size_t size)
+{
+	// 1. 버퍼의 시작 주소 자체는 get_validated_kaddr가 검사해 줄 것이므로
+	//    여기서는 size가 0인 경우만 간단히 처리하고 넘어간다.
+	if (size == 0)
+	{
+		return;
+	}
+
+	// 2. 버퍼가 걸쳐 있는 각 페이지에 대해 검사를 수행한다.
+	uintptr_t current_addr;
+	for (current_addr = (uintptr_t)pg_round_down(buf);
+		 current_addr < (uintptr_t)buf + size;
+		 current_addr += PGSIZE)
+	{
+		// get_validated_kaddr는 uaddr의 유효성을 검사하고,
+		// 실패 시 알아서 exit_bad_user()를 호출한다.
+		// 우리는 그냥 호출해주기만 하면 된다.
+		get_validated_kaddr((void *)current_addr);
+	}
+}
+
+// uaddr에서 바이트 하나를 안전하게 읽기
+static inline uint8_t
+safe_read_u8(const void *uaddr)
+{
+	const uint8_t *kaddr = get_validated_kaddr(uaddr);
+	return *kaddr;
+}
+
+// uaddr에 바이트 하나를 안전하게 쓰기
+static void safe_write_u8(const void *uaddr, uint8_t value)
+{
+	uint8_t *kaddr = get_validated_kaddr(uaddr);
+	*kaddr = value;
+}
+
+static void *safe_copy_to_user(const char *user_dest, const char *kernel_src, size_t size)
+{
+	// 한 바이트씩 순회하며 복사
+	for (int i = 0; i < size; i++)
+	{
+		// 1. 현재 복사할 소스 바이트를 가져온다 (커널 메모리이므로 직접 접근 가능)
+		char byte_to_copy = kernel_src[i];
+		// 2. 현재 데이터를 써야 할 목적지 주소 계산
+		const char *current_user_addr = user_dest + i;
+		// 3. 해당 목적지 주소에 한 바이트를 '안전하게' 쓴다.
+		//    이 작업은 별도의 헬퍼 함수로 만드는 것이 깔끔하다.
+		safe_write_u8(current_user_addr, byte_to_copy);
+	}
 }
 
 // 반환: 커널 힙에 새로 할당된 NUL-종료 문자열 (caller가 free)
 // too_long: 원본이 maxlen을 초과(= maxlen 내에 NUL 없음)했는지 신호
-char *
-copy_in_string_k(const char *ustr, size_t maxlen, bool *too_long)
+char *copy_in_string_k(const char *ustr, size_t maxlen, bool *too_long)
 {
-	if (ustr == NULL)
-	{
-		exit_bad_user();
-	}
-
-	char *buf = malloc(maxlen + 1); // +1 for NUL
-	ASSERT(buf != NULL);
+	char *kbuf = malloc(maxlen + 1); // +1 for NUL
+	ASSERT(kbuf != NULL);
 
 	size_t i = 0;
 	bool found_nul = false;
 
 	// 최대 maxlen 바이트까지만 시도.
-	while (i < maxlen)
+	for (i = 0; i < maxlen; i++)
 	{
 		// 매 루프에서 safe_read_u8(ustr + i)로 바이트 단위 검증+복사. (페이지 경계 안전)
 		uint8_t ch = safe_read_u8(ustr + i);
 
-		// 유저 문자열이 여기서 끝나면 found_nul=true로 표시하고 커널 버퍼에도 '\0' 기록.
+		kbuf[i] = ch;
+		// '\0'을 찾으면 found_nul을 true로 바꾸고 루프 종료
 		if (ch == '\0')
 		{
 			found_nul = true;
-			buf[i] = '\0';
 			break;
 		}
-		buf[i++] = (char)ch;
 	}
 
-	/* NUL을 못 만났다 = 원본 문자열이 maxlen 초과.
-	 * 이건 “잘못된 포인터”가 아니라 정책 위반(과길이) 이므로 프로세스 kill 금지.
-	 * 상위(예: sys_create)에서 false를 리턴하도록 신호만 올린다.
-	 * 반면 잘못된 포인터/커널 영역/미매핑은 앞서 safe_read_u8()에서 즉시 종료 처리.
-	 * 두 경우를 확실히 분리해야 한다! */
-	if (!found_nul)
+	// NUL 문자를 못 찾았을 경우를 대비해, 문자열을 강제로 null-terminated로 만들어준다.
+	kbuf[i] = '\0';
+
+	if (too_long != NULL)
 	{
-		buf[i] = '\0'; // 안전상 트렁케이트
-		if (too_long)
-			*too_long = true; // 길이 초과 신호 (프로세스 kill 아님!)
+		*too_long = !found_nul;
 	}
-	else
-	{
-		if (too_long)
-			*too_long = false;
-	}
-	return buf;
+
+	return kbuf;
 }
 
 /* fd 헬퍼 */
@@ -207,20 +258,20 @@ void syscall_init(void)
 typedef void (*syscall_handler_t)(struct intr_frame *f); // 함수 포인터 형 재선언
 
 static const syscall_handler_t syscall_tbl[] = {
-	NULL,		// SYS_HALT
-	sys_exit,	// SYS_EXIT
-	NULL,		// SYS_FORK
-	NULL,		// SYS_EXEC
-	NULL,		// SYS_WAIT
-	sys_create, // SYS_CREATE
-	NULL,		// SYS_REMOVE
-	sys_open,	// SYS_OPEN
-	NULL,		// SYS_FILESIZE
-	NULL,		// SYS_READ
-	sys_write,	// SYS_WRITE
-	NULL,		// SYS_SEEK
-	NULL,		// SYS_TELL
-	sys_close,	// SYS_CLOSE
+	NULL,		  // SYS_HALT
+	sys_exit,	  // SYS_EXIT
+	NULL,		  // SYS_FORK
+	NULL,		  // SYS_EXEC
+	NULL,		  // SYS_WAIT
+	sys_create,	  // SYS_CREATE
+	NULL,		  // SYS_REMOVE
+	sys_open,	  // SYS_OPEN
+	sys_filesize, // SYS_FILESIZE
+	sys_read,	  // SYS_READ
+	sys_write,	  // SYS_WRITE
+	NULL,		  // SYS_SEEK
+	NULL,		  // SYS_TELL
+	sys_close,	  // SYS_CLOSE
 };
 
 static void sys_exit(struct intr_frame *f)
@@ -237,13 +288,18 @@ static void sys_exit(struct intr_frame *f)
  * 1. %rax에는 시스템 콜 번호가 저장
  * 2. 네 번째 인자는 %rcx가 아니라 %r10에 저장
  * 따라서 시스템 콜 핸들러인 syscall_handler()가 제어권을 넘겨받으면, 시스템 콜 번호는 rax에 있고,
- * 인자들은 %rdi, %rsi, %rdx, %r10, %r8, %r9 순서로 전달됨 (6개 이상 부터는 스택에 저장)
+ * 인자들은 %rdi, %rsi, %rdx, %r10, %r8, %r9 순서로 전달됨 (6개 이상 부터는 스택에 저장)`
  */
 static void sys_write(struct intr_frame *f)
 {
 	int fd = (int)f->R.rdi;
 	const char *buf = (const char *)f->R.rsi;
 	size_t size = (size_t)f->R.rdx;
+	if (size == 0)
+	{
+		f->R.rax = 0;
+		return;
+	}
 
 	if (fd == 1)
 	{
@@ -268,6 +324,8 @@ static void sys_create(struct intr_frame *f)
 	unsigned size = (unsigned)f->R.rsi;
 
 	bool too_long = false;
+
+	char *buf;
 	char *name_k = copy_in_string_k(file_u, NAME_MAX, &too_long);
 
 	if (too_long)
@@ -323,6 +381,66 @@ static void sys_close(struct intr_frame *f)
 	fd_close(fd);
 }
 
+static void sys_read(struct intr_frame *f)
+{
+	int fd = (int)f->R.rdi;
+	const char *buf = (const char *)f->R.rsi;
+	size_t size = (size_t)f->R.rdx;
+
+	check_valid_buffer(buf, size);
+
+	if (size == 0)
+	{
+		f->R.rax = 0;
+		return;
+	}
+	if (fd == 1) // stdout
+	{
+		f->R.rax = -1;
+		return;
+	}
+	if (fd == 0)
+	{
+		f->R.rax = input_getc();
+		return;
+	}
+
+	struct file *file = fd_get(fd);
+	if (file == NULL) // read-bad-fd
+	{
+		f->R.rax = -1;
+		return;
+	}
+
+	char *kbuf = malloc(size);
+	if (kbuf == NULL)
+	{
+		f->R.rax = -1; // 메모리 부족
+		return;
+	}
+
+	off_t bytes_read = file_read(file, kbuf, size);
+
+	safe_copy_to_user(buf, kbuf, bytes_read);
+
+	// 5. 자원 해제 및 결과 반환
+	free(kbuf);
+	f->R.rax = bytes_read;
+}
+
+static void sys_filesize(struct intr_frame *f)
+{
+	int fd = (int)f->R.rdi;
+	struct file *file = fd_get(fd);
+	if (file == NULL)
+	{
+		f->R.rax = -1;
+		return;
+	}
+	f->R.rax = file_length(file);
+}
+
+/* The main system call interface */
 void syscall_handler(struct intr_frame *f)
 {
 	// 시스템 콜 번호

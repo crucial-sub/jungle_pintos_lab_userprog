@@ -18,6 +18,7 @@
 #include "threads/mmu.h"
 #include "threads/vaddr.h"
 #include "intrinsic.h"
+#include "userprog/syscall.h"
 #ifdef VM
 #include "vm/vm.h"
 #endif
@@ -223,7 +224,10 @@ void process_exit(void)
 	 * TODO: Implement process termination message (see
 	 * TODO: project2/process_termination.html).
 	 * TODO: We recommend you to implement process resource cleanup here. */
+#ifdef USERPROG
+	fd_close_all();
 	printf("%s: exit(%d)\n", curr->name, curr->exit_status);
+#endif
 	process_cleanup();
 }
 
