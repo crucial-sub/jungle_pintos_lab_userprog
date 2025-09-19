@@ -24,6 +24,7 @@
     "synch.h": "c",
     "stddef.h": "c",
     "debug.h": "c",
-    "vaddr.h": "c"
+    "vaddr.h": "c",
+    "loader.h": "c"
   }
 }

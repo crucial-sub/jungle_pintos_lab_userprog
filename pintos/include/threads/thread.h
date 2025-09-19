@@ -112,6 +112,9 @@ struct thread
 	struct thread *parent;			   // 자신의 부모 프로세스를 가리키는 포인터
 	struct list children;			   // 자신의 자식 프로세스 목록을 관리하기 위한 리스트
 	struct child_status *child_status; // 부모-자식 관계를 위한 구조체
+
+	/* exec 파일 관리 */
+	struct file *exec_file;
 #endif
 #ifdef VM
 	/* Table for whole virtual memory owned by thread. */

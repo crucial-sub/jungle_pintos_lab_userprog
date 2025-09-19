@@ -21,6 +21,7 @@ void syscall_entry(void);
 void syscall_handler(struct intr_frame *);
 static void sys_wait(struct intr_frame *f);
 static void sys_exit(struct intr_frame *f);
+static void sys_exec(struct intr_frame *f);
 static void sys_write(struct intr_frame *f);
 static void sys_create(struct intr_frame *f);
 static void sys_open(struct intr_frame *f);
@@ -278,7 +279,7 @@ static const syscall_handler_t syscall_tbl[] = {
 	NULL,		  // SYS_HALT
 	sys_exit,	  // SYS_EXIT
 	NULL,		  // SYS_FORK
-	NULL,		  // SYS_EXEC
+	sys_exec,	  // SYS_EXEC
 	sys_wait,	  // SYS_WAIT
 	sys_create,	  // SYS_CREATE
 	NULL,		  // SYS_REMOVE
@@ -317,6 +318,30 @@ static void sys_wait(struct intr_frame *f)
 {
 	pid_t pid = f->R.rdi;
 	f->R.rax = process_wait(pid);
+}
+
+static void sys_exec(struct intr_frame *f)
+{
+	struct thread *curr = thread_current();
+	const char *cmd_line_u = (const char *)f->R.rdi;
+	bool too_long = false;
+	char *cmd_line_k = copy_in_string_k(cmd_line_u, PGSIZE, &too_long);
+	if (cmd_line_k == NULL || too_long)
+	{
+		curr->exit_status = -1;
+		thread_exit();
+	}
+
+	char *fn_copy = palloc_get_page(0);
+	strlcpy(fn_copy, cmd_line_k, PGSIZE);
+	free(cmd_line_k);
+
+	int res = process_exec(fn_copy);
+	if (res == -1)
+	{
+		curr->exit_status = -1;
+		thread_exit();
+	}
 }
 
 static void sys_create(struct intr_frame *f)

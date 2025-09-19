@@ -4,6 +4,7 @@
 #include <round.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/tss.h"
@@ -14,6 +15,7 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/mmu.h"
 #include "threads/vaddr.h"
@@ -29,12 +31,24 @@ static void process_cleanup(void);
 static bool load(const char *file_name, struct intr_frame *if_);
 static void initd(void *f_name);
 static void __do_fork(void *);
+static void extract_prog_name(const char *cmdline, char out_name[16]);
 
 /* General process initializer for initd and other process. */
-static void
-process_init(void)
+static void process_init(void)
 {
 	struct thread *current = thread_current();
+}
+
+static void extract_prog_name(const char *cmdline, char out_name[16])
+{
+	size_t i = 0;
+	// 첫 공백류(isspace) 전까지, 그리고 최대 15글자만
+	while (cmdline[i] != '\0' && !isspace((unsigned char)cmdline[i]) && i < sizeof(((struct thread *)0)->name) - 1)
+	{
+		out_name[i] = cmdline[i];
+		i++;
+	}
+	out_name[i] = '\0';
 }
 
 /* Starts the first userland program, called "initd", loaded from FILE_NAME.
@@ -55,7 +69,10 @@ tid_t process_create_initd(const char *file_name)
 	strlcpy(fn_copy, file_name, PGSIZE);
 
 	/* Create a new thread to execute FILE_NAME. */
-	tid = thread_create(file_name, PRI_DEFAULT, initd, fn_copy);
+	char prog_name[16];
+	extract_prog_name(file_name, prog_name); // 이름만 별도 추출
+
+	tid = thread_create(prog_name, PRI_DEFAULT, initd, fn_copy);
 	if (tid == TID_ERROR)
 		palloc_free_page(fn_copy);
 	return tid;
@@ -271,7 +288,10 @@ void process_exit(void)
 		}
 	}
 	// 3. 반드시 부모를 깨우기 전에 종료 메시지를 찍는다
-	printf("%s: exit(%d)\n", curr->name, curr->exit_status);
+	if (curr->pml4 != NULL)
+	{
+		printf("%s: exit(%d)\n", curr->name, curr->exit_status);
+	}
 
 	// 4. 사용자 자원 정리(순서는 자유, 커널 printf와 독립)
 	fd_close_all();
@@ -291,6 +311,12 @@ static void
 process_cleanup(void)
 {
 	struct thread *curr = thread_current();
+
+	if (curr->exec_file != NULL)
+	{
+		file_close(curr->exec_file);
+		curr->exec_file = NULL;
+	}
 
 #ifdef VM
 	supplemental_page_table_kill(&curr->spt);
@@ -440,8 +466,13 @@ load(const char *file_name, struct intr_frame *if_)
 		printf("load: %s: open failed\n", prog);
 		goto done;
 	}
+	else
+	{
+		file_deny_write(file);
+		t->exec_file = file;
+	}
 	// 스레드 이름을 위에서 파싱한 실행 파일 이름으로 변경
-	strlcpy(t->name, prog, sizeof t->name);
+	// strlcpy(t->name, prog, sizeof t->name);
 
 	/* Read and verify executable header. */
 	if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr || memcmp(ehdr.e_ident, "\177ELF\2\1\1", 7) || ehdr.e_type != 2 || ehdr.e_machine != 0x3E // amd64
@@ -562,7 +593,14 @@ load(const char *file_name, struct intr_frame *if_)
 
 done:
 	/* We arrive here whether the load is successful or not. */
-	file_close(file);
+	if (!success)
+	{
+		if (file != NULL)
+		{
+			file_close(file);
+			t->exec_file = NULL;
+		}
+	}
 	return success;
 }
 
