@@ -23,8 +23,10 @@
 #include "vm/vm.h"
 #endif
 
+#define WORD 8 // 64-bit
+
 static void process_cleanup(void);
-static bool load(char *file_name, struct intr_frame *if_);
+static bool load(const char *file_name, struct intr_frame *if_);
 static void initd(void *f_name);
 static void __do_fork(void *);
 
@@ -203,30 +205,83 @@ int process_exec(void *f_name)
  *
  * This function will be implemented in problem 2-2.  For now, it
  * does nothing. */
-int process_wait(tid_t child_tid UNUSED)
+int process_wait(tid_t child_tid)
 {
-	/* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
-	 * XXX:       to add infinite loop here before
-	 * XXX:       implementing the process_wait. */
-	for (int i = 0; i < 1000; i++)
+	struct thread *curr = thread_current();
+
+	struct list_elem *e;
+	struct child_status *cs = NULL;
+
+	// 자식 리스트에서 해당하는 cs를 찾는다
+	for (e = list_begin(&(curr->children)); e != list_end(&(curr->children)); e = list_next(e))
 	{
-		thread_yield();
+		struct child_status *cand = list_entry(e, struct child_status, child_elem);
+		if (cand->tid == child_tid)
+		{
+			cs = cand;
+			break;
+		}
+	}
+	if (cs == NULL)
+	{
+		return -1;
 	}
 
-	return -1;
+	// 자식이 `sema_up` 해줄 때까지 기다린다.
+	sema_down(&cs->sema);
+
+	// 자식이 깨워주면, 리스트에서 제거하고 상태를 읽는다.
+	list_remove(&cs->child_elem);
+	int status = cs->exit_status;
+
+	cs->refer_cnt--;
+
+	if (cs->refer_cnt == 0)
+	{
+		free(cs);
+	}
+
+	return status;
 }
 
 /* Exit the process. This function is called by thread_exit (). */
 void process_exit(void)
 {
-	struct thread *curr = thread_current();
-	/* TODO: Your code goes here.
-	 * TODO: Implement process termination message (see
-	 * TODO: project2/process_termination.html).
-	 * TODO: We recommend you to implement process resource cleanup here. */
 #ifdef USERPROG
-	fd_close_all();
+	struct thread *curr = thread_current();
+
+	// 종료하기 전 부모에게 자신의 마지막 상태를 알림
+	if (curr->child_status != NULL)
+	{
+		// 1. 자신의 상태 보고서(child_status)를 찾는다.
+		struct child_status *cs = curr->child_status;
+
+		// 2. 보고서에 최종 상태를 기록한다.
+		cs->exit_status = curr->exit_status;
+		cs->dead = true;
+
+		// 자식의 참조 카운트를 1 감소시킨다.
+		cs->refer_cnt--;
+
+		// 만약 카운트가 0이 되면 (부모가 이미 wait을 끝내고 떠난 경우),
+		// 자식이 직접 메모리를 해제한다.
+		if (cs->refer_cnt == 0)
+		{
+			free(cs);
+		}
+	}
+	// 3. 반드시 부모를 깨우기 전에 종료 메시지를 찍는다
 	printf("%s: exit(%d)\n", curr->name, curr->exit_status);
+
+	// 4. 사용자 자원 정리(순서는 자유, 커널 printf와 독립)
+	fd_close_all();
+
+	// 5. 이제 부모를 깨운다 — 부모가 곧바로 power_off 해도 메시지는 이미 출력됨
+	if (curr->child_status != NULL)
+	{
+		sema_up(&curr->child_status->sema);
+	}
+
 #endif
 	process_cleanup();
 }
@@ -339,7 +394,7 @@ static bool load_segment(struct file *file, off_t ofs, uint8_t *upage,
  * and its initial stack pointer into *RSP.
  * Returns true if successful, false otherwise. */
 static bool
-load(char *file_name, struct intr_frame *if_)
+load(const char *file_name, struct intr_frame *if_)
 {
 	struct thread *t = thread_current();
 	struct ELF ehdr;
@@ -354,7 +409,10 @@ load(char *file_name, struct intr_frame *if_)
 	int argc = 0;
 	char *argv[MAX_ARGS];
 
-	for (token = strtok_r(file_name, " ", &saveptr); token != NULL; token = strtok_r(NULL, " ", &saveptr))
+	char *mut = palloc_get_page(PAL_ZERO);
+	strlcpy(mut, file_name, PGSIZE);
+
+	for (token = strtok_r(mut, " ", &saveptr); token != NULL; token = strtok_r(NULL, " ", &saveptr))
 	{
 		if (argc == MAX_ARGS)
 		{
@@ -477,11 +535,11 @@ load(char *file_name, struct intr_frame *if_)
 	sp = (uint8_t *)((uintptr_t)sp & ~0x7ULL);
 
 	// 포인터 배열(유저 영역)
-	sp -= 8;
+	sp -= WORD;
 	*(uint64_t *)sp = 0; // argv[argc] == NULL
 	for (i = argc - 1; i >= 0; i--)
 	{
-		sp -= 8;
+		sp -= WORD;
 		*(uint64_t *)sp = (uint64_t)uaddr[i];
 	}
 	// 스택에 쌓아둔 argv[0] 포인터가 놓인 "argv 배열의 시작 주소"
@@ -493,7 +551,7 @@ load(char *file_name, struct intr_frame *if_)
 	if_->R.rsi = (uint64_t)argv_user;
 
 	// 가짜 주소
-	sp -= 8;
+	sp -= WORD;
 	*(uint64_t *)sp = 0;
 
 	// 유저 스택 최상단과 유저 프로그램 시작 주소(ELF의 e_entry, 보통 _start) 지정

@@ -5,6 +5,7 @@
 #include <list.h>
 #include <stdint.h>
 #include "threads/interrupt.h"
+#include "threads/synch.h"
 #ifdef VM
 #include "vm/vm.h"
 #endif
@@ -29,7 +30,7 @@ typedef int tid_t;
 #define PRI_MAX 63	   /* Highest priority. */
 
 struct file;
-#define FD_MAX 128
+#define FD_MAX 16
 
 /* A kernel thread or user process.
  *
@@ -106,6 +107,11 @@ struct thread
 	/* 프로세스 별 FD테이블 추가 */
 	struct file *fd_table[FD_MAX]; // 열린 파일들의 포인터 저장
 	int fd_next;				   // 다음에 할당할 FD 번호
+
+	/* 부모-자식 관계 정립 및 자식 프로세스 추적 */
+	struct thread *parent;			   // 자신의 부모 프로세스를 가리키는 포인터
+	struct list children;			   // 자신의 자식 프로세스 목록을 관리하기 위한 리스트
+	struct child_status *child_status; // 부모-자식 관계를 위한 구조체
 #endif
 #ifdef VM
 	/* Table for whole virtual memory owned by thread. */
@@ -130,6 +136,16 @@ struct thread
 
 	/* 지금 대기 중인 락 (없으면 NULL). 중첩 기부 전파용 */
 	struct lock *wait_on_lock;
+};
+
+struct child_status
+{
+	tid_t tid;					 // 자식 tid
+	int exit_status;			 // 자식 exit status
+	int refer_cnt;				 // 참조 카운트(부모 1 + 자식 1 = 초기값 2)
+	bool dead;					 // 자식 종료 여부
+	struct semaphore sema;		 // 자식 종료 시 sema_up으로 부모를 깨움, 부모는 여기서 down
+	struct list_elem child_elem; // 부모의 children 리스트에 들어갈 노드
 };
 
 /* If false (default), use round-robin scheduler.

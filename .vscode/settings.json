@@ -20,6 +20,10 @@
     "system_error": "c",
     "functional": "c",
     "tuple": "c",
-    "type_traits": "c"
+    "type_traits": "c",
+    "synch.h": "c",
+    "stddef.h": "c",
+    "debug.h": "c",
+    "vaddr.h": "c"
   }
 }

@@ -11,6 +11,7 @@
 #include "threads/flags.h"
 #include "intrinsic.h"
 #include "lib/kernel/stdio.h"
+#include "lib/user/syscall.h"
 #include "threads/palloc.h"
 #include "threads/malloc.h"
 #include "filesys/filesys.h"
@@ -18,6 +19,7 @@
 
 void syscall_entry(void);
 void syscall_handler(struct intr_frame *);
+static void sys_wait(struct intr_frame *f);
 static void sys_exit(struct intr_frame *f);
 static void sys_write(struct intr_frame *f);
 static void sys_create(struct intr_frame *f);
@@ -30,7 +32,7 @@ static void *get_validated_kaddr(const void *uaddr);
 static void check_valid_buffer(const void *buf, size_t size);
 static inline uint8_t safe_read_u8(const void *uaddr);
 static void safe_write_u8(const void *uaddr, uint8_t v);
-static void *safe_copy_to_user(const char *user_dest, const char *kernel_src, size_t size);
+static void safe_copy_to_user(const char *user_dest, const char *kernel_src, size_t size);
 char *copy_in_string_k(const char *ustr, size_t maxlen, bool *too_long);
 
 /* System call.
@@ -98,16 +100,19 @@ static void check_valid_buffer(const void *buf, size_t size)
 		return;
 	}
 
+	uintptr_t start = (uintptr_t)buf;
+	uintptr_t end = start + size - 1;
+
 	// 2. 버퍼가 걸쳐 있는 각 페이지에 대해 검사를 수행한다.
 	uintptr_t current_addr;
-	for (current_addr = (uintptr_t)pg_round_down(buf);
-		 current_addr < (uintptr_t)buf + size;
+	for (current_addr = start & ~(PGSIZE - 1);
+		 current_addr < end;
 		 current_addr += PGSIZE)
 	{
 		// get_validated_kaddr는 uaddr의 유효성을 검사하고,
 		// 실패 시 알아서 exit_bad_user()를 호출한다.
 		// 우리는 그냥 호출해주기만 하면 된다.
-		get_validated_kaddr((void *)current_addr);
+		(void)get_validated_kaddr((const void *)current_addr);
 	}
 }
 
@@ -126,7 +131,7 @@ static void safe_write_u8(const void *uaddr, uint8_t value)
 	*kaddr = value;
 }
 
-static void *safe_copy_to_user(const char *user_dest, const char *kernel_src, size_t size)
+static void safe_copy_to_user(const char *user_dest, const char *kernel_src, size_t size)
 {
 	// 한 바이트씩 순회하며 복사
 	for (int i = 0; i < size; i++)
@@ -141,13 +146,15 @@ static void *safe_copy_to_user(const char *user_dest, const char *kernel_src, si
 	}
 }
 
-static void *safe_copy_from_user(const char *kernel_dest, const char *user_src, size_t size)
+// 유저 주소(user_src)에서 커널 버퍼(kernel_dest)로 안전 복사
+static void safe_copy_from_user(void *kernel_dest, const char *user_src, size_t size)
 {
-	for (int i = 0; i < size; i++)
+	uint8_t *kd = (uint8_t *)kernel_dest;
+	const uint8_t *uu = (const uint8_t *)user_src;
+	for (size_t i = 0; i < size; i++)
 	{
-		char byte_to_copy = user_src[i];
-		const char *current_kernel_addr = kernel_dest + i;
-		safe_write_u8(current_kernel_addr, byte_to_copy);
+		// 유저 공간에서 안전하게 1바이트를 읽어와서 커널 버퍼에 '직접' 저장
+		kd[i] = safe_read_u8(uu + i);
 	}
 }
 
@@ -227,16 +234,16 @@ struct file *fd_get(int fd)
 }
 
 // fd 해제: fd_table에 번호 반납하고 실제 파일도 close
-void fd_close(int fd)
+bool fd_close(int fd)
 {
 	struct thread *t = thread_current();
-	if (fd < 0 || fd >= FD_MAX)
-		return;
-	if (t->fd_table[fd])
+	if (fd < 2 || fd >= FD_MAX || t->fd_table[fd] == NULL)
 	{
-		file_close(t->fd_table[fd]);
-		t->fd_table[fd] = NULL;
+		return false; // 닫을 수 없는 fd
 	}
+	file_close(t->fd_table[fd]);
+	t->fd_table[fd] = NULL;
+	return true;
 }
 
 void fd_close_all()
@@ -272,7 +279,7 @@ static const syscall_handler_t syscall_tbl[] = {
 	sys_exit,	  // SYS_EXIT
 	NULL,		  // SYS_FORK
 	NULL,		  // SYS_EXEC
-	NULL,		  // SYS_WAIT
+	sys_wait,	  // SYS_WAIT
 	sys_create,	  // SYS_CREATE
 	NULL,		  // SYS_REMOVE
 	sys_open,	  // SYS_OPEN
@@ -304,6 +311,12 @@ static void sys_badcall(struct intr_frame *f)
 {
 	f->R.rdi = (uint64_t)-1;
 	sys_exit(f);
+}
+
+static void sys_wait(struct intr_frame *f)
+{
+	pid_t pid = f->R.rdi;
+	f->R.rax = process_wait(pid);
 }
 
 static void sys_create(struct intr_frame *f)
@@ -365,8 +378,14 @@ static void sys_open(struct intr_frame *f)
 static void sys_close(struct intr_frame *f)
 {
 	int fd = (int)f->R.rdi;
-
-	fd_close(fd);
+	if (fd_close(fd))
+	{
+		f->R.rax = 0; // 성공
+	}
+	else
+	{
+		f->R.rax = -1; // 실패
+	}
 }
 
 static void sys_read(struct intr_frame *f)
@@ -431,7 +450,7 @@ static void sys_filesize(struct intr_frame *f)
 static void sys_write(struct intr_frame *f)
 {
 	int fd = (int)f->R.rdi;
-	const char *buf = (const char *)f->R.rsi;
+	const char *ubuf = (const void *)f->R.rsi;
 	size_t size = (size_t)f->R.rdx;
 	if (size == 0)
 	{
@@ -439,20 +458,22 @@ static void sys_write(struct intr_frame *f)
 		return;
 	}
 
-	check_valid_buffer(buf, size);
+	// 유저 버퍼 전체가 유효한지 페이지 단위로 검증
+	check_valid_buffer(ubuf, size);
 
-	if (fd == 1)
-	{
-		putbuf(buf, size);
-		f->R.rax = size;
-		return;
-	}
-	if (fd == 0)
+	if (fd == 0) // stdin에 write → 에러
 	{
 		f->R.rax = -1;
 		return;
 	}
-	if (fd > 1)
+	if (fd == 1) // stdout
+	{
+		// 콘솔로 바로 내보내기
+		putbuf(ubuf, size);
+		f->R.rax = size;
+		return;
+	}
+	if (fd > 1) // 일반 파일에 쓰는 경우
 	{
 		struct file *file = fd_get(fd);
 		if (file == NULL)
@@ -461,20 +482,23 @@ static void sys_write(struct intr_frame *f)
 			return;
 		}
 
-		char *ubuf = malloc(size);
-		if (ubuf == NULL)
+		// 1. 커널 버퍼 할당
+		char *kbuf = malloc(size);
+		if (kbuf == NULL)
 		{
 			f->R.rax = -1; // 메모리 부족
 			return;
 		}
 
-		off_t bytes_read = file_write(file, ubuf, size);
+		// 2. 유저 버퍼의 내용을 커널 버퍼로 안전하게 복사
+		safe_copy_from_user(kbuf, ubuf, size);
 
-		safe_copy_from_user(buf, ubuf, bytes_read);
+		// 3. 커널 버퍼의 내용을 파일에 쓰기
+		off_t bytes_written = file_write(file, kbuf, size);
 
-		// 5. 자원 해제 및 결과 반환
-		free(ubuf);
-		f->R.rax = bytes_read;
+		// 4. 자원 해제 및 결과 반환
+		free(kbuf);
+		f->R.rax = bytes_written;
 	}
 }
 

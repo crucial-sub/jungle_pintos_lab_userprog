@@ -191,6 +191,31 @@ tid_t thread_create(const char *name, int priority,
 	init_thread(t, name, priority);
 	tid = t->tid = allocate_tid();
 
+#ifdef USERPROG
+	// 1. 자식 상태를 담을 구조체를 동적 할당
+	// (부모-자식이 공유해야 하고, 자식이 먼저 죽어도 살아남아야 하므로)
+	struct child_status *cs = malloc(sizeof(struct child_status));
+	if (cs == NULL)
+	{
+		// 메모리 할당 실패 시 스레드 생성을 중단하고 에러 반환
+		palloc_free_page(t);
+		return TID_ERROR;
+	}
+
+	// 2. 자식 상태 구조체의 필드를 초기화
+	cs->tid = tid;			 // 자식의 tid 저장
+	cs->exit_status = 0;	 // 초기 종료 상태
+	cs->refer_cnt = 2;		 // 부모와 자식, 총 2개가 참조
+	cs->dead = false;		 // 아직 살아있음
+	sema_init(&cs->sema, 0); // wait을 위한 세마포어 초기화 (초기값 0)
+
+	// 3. 부모(현재 스레드)의 자식 리스트에 이 구조체를 추가합니다.
+	list_push_back(&thread_current()->children, &cs->child_elem);
+
+	// 4. 자식 스레드가 자신의 상태 구조체를 알 수 있도록 포인터를 연결해줍니다.
+	t->child_status = cs;
+#endif
+
 	/* Call the kernel_thread if it scheduled.
 	 * Note) rdi is 1st argument, and rsi is 2nd argument. */
 	t->tf.rip = (uintptr_t)kernel_thread;
@@ -454,6 +479,22 @@ init_thread(struct thread *t, const char *name, int priority)
 	t->fd_next = 2; /* 0=stdin, 1=stdout 예약 */
 	for (int i = 0; i < FD_MAX; i++)
 		t->fd_table[i] = NULL;
+
+	// 1. 자신의 부모가 누구인지 설정
+	if (t == initial_thread)
+	{
+		t->parent = NULL; // 'initial_thread'는 부모가 없음
+	}
+	else
+	{
+		t->parent = thread_current(); // 그 외 모든 스레드의 부모는 현재 실행중인 스레드
+	}
+	// 2. 자신의 자식 리스트를 초기화 (지금은 자식이 없으므로 빈 리스트)
+	list_init(&t->children);
+
+	// 3. 자신의 상태 구조체 포인터(t->child_status)는
+	//    이 함수가 끝난 후 부모가 `thread_create`에서 설정해 줄 것이므로
+	//    여기서는 초기화하지 않음.
 #endif
 }
 
