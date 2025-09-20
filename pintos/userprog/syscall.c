@@ -24,10 +24,13 @@ static void sys_exit(struct intr_frame *f);
 static void sys_exec(struct intr_frame *f);
 static void sys_write(struct intr_frame *f);
 static void sys_create(struct intr_frame *f);
+static void sys_remove(struct intr_frame *f);
 static void sys_open(struct intr_frame *f);
 static void sys_close(struct intr_frame *f);
 static void sys_read(struct intr_frame *f);
 static void sys_filesize(struct intr_frame *f);
+static void sys_seek(struct intr_frame *f);
+static void sys_tell(struct intr_frame *f);
 static void sys_badcall(struct intr_frame *f);
 static void *get_validated_kaddr(const void *uaddr);
 static void check_valid_buffer(const void *buf, size_t size);
@@ -52,7 +55,8 @@ char *copy_in_string_k(const char *ustr, size_t maxlen, bool *too_long);
 /* 유저 포인터 검증 실패를 즉시 종료로 처리해야 커널이 안전하며 테스트 요구사항을 만족한다.
  * => exit_bad_user(): 해당 프로세스만 깔끔하게 종료시키는 함수 */
 // __attribute__((noreturn)): 이 함수는 절대 리턴하지 않는다고 컴파일러에 선언
-static __attribute__((noreturn)) void exit_bad_user(void)
+static __attribute__((noreturn)) void
+exit_bad_user(void)
 {
 	struct thread *t = thread_current();
 	t->exit_status = -1; // exit(-1)
@@ -282,13 +286,13 @@ static const syscall_handler_t syscall_tbl[] = {
 	sys_exec,	  // SYS_EXEC
 	sys_wait,	  // SYS_WAIT
 	sys_create,	  // SYS_CREATE
-	NULL,		  // SYS_REMOVE
+	sys_remove,	  // SYS_REMOVE
 	sys_open,	  // SYS_OPEN
 	sys_filesize, // SYS_FILESIZE
 	sys_read,	  // SYS_READ
 	sys_write,	  // SYS_WRITE
-	NULL,		  // SYS_SEEK
-	NULL,		  // SYS_TELL
+	sys_seek,	  // SYS_SEEK
+	sys_tell,	  // SYS_TELL
 	sys_close,	  // SYS_CLOSE
 };
 
@@ -365,6 +369,28 @@ static void sys_create(struct intr_frame *f)
 	else
 	{
 		f->R.rax = filesys_create(name_k, size);
+	}
+
+	free(name_k);
+}
+
+static void sys_remove(struct intr_frame *f)
+{
+	const char *file_u = (const char *)f->R.rdi;
+	bool too_long = false;
+	char *name_k = copy_in_string_k(file_u, NAME_MAX, &too_long);
+
+	if (too_long)
+	{
+		f->R.rax = false;
+	}
+	else if (name_k[0] == '\0')
+	{
+		f->R.rax = false;
+	}
+	else
+	{
+		f->R.rax = filesys_remove(name_k);
 	}
 
 	free(name_k);
@@ -470,6 +496,35 @@ static void sys_filesize(struct intr_frame *f)
 		return;
 	}
 	f->R.rax = file_length(file);
+}
+
+static void sys_seek(struct intr_frame *f)
+{
+	int fd = (int)f->R.rdi;
+	off_t position = (off_t)f->R.rsi;
+
+	struct file *file = fd_get(fd);
+	if (file == NULL)
+	{
+		f->R.rax = -1;
+		return;
+	}
+
+	file_seek(file, position);
+
+	f->R.rax = file_tell(file);
+}
+
+static void sys_tell(struct intr_frame *f)
+{
+	int fd = (int)f->R.rdi;
+	struct file *file = fd_get(fd);
+	if (file == NULL)
+	{
+		f->R.rax = -1;
+		return;
+	}
+	f->R.rax = file_tell(file);
 }
 
 static void sys_write(struct intr_frame *f)

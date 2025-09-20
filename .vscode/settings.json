@@ -25,6 +25,14 @@
     "stddef.h": "c",
     "debug.h": "c",
     "vaddr.h": "c",
-    "loader.h": "c"
+    "loader.h": "c",
+    "inode.h": "c",
+    "stdbool.h": "c",
+    "stdint.h": "c",
+    "algorithm": "c",
+    "boundary.h": "c",
+    "lib.h": "c",
+    "file.h": "c",
+    "off_t.h": "c"
   }
 }
