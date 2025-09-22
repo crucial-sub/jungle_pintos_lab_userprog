@@ -206,7 +206,6 @@ tid_t thread_create(const char *name, int priority,
 	cs->tid = tid;			 // 자식의 tid 저장
 	cs->exit_status = 0;	 // 초기 종료 상태
 	cs->refer_cnt = 2;		 // 부모와 자식, 총 2개가 참조
-	cs->dead = false;		 // 아직 살아있음
 	sema_init(&cs->sema, 0); // wait을 위한 세마포어 초기화 (초기값 0)
 
 	// 3. 부모(현재 스레드)의 자식 리스트에 이 구조체를 추가합니다.

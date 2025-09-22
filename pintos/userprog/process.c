@@ -33,6 +33,13 @@ static void initd(void *f_name);
 static void __do_fork(void *);
 static void extract_prog_name(const char *cmdline, char out_name[16]);
 
+struct fork_aux
+{
+	struct intr_frame parent_if;
+	struct semaphore fork_sema;
+	bool success;
+};
+
 /* General process initializer for initd and other process. */
 static void process_init(void)
 {
@@ -50,6 +57,12 @@ static void extract_prog_name(const char *cmdline, char out_name[16])
 	}
 	out_name[i] = '\0';
 }
+
+// struct fork_aux {
+// 	struct intr_frame *parent_if;
+// 	struct semaphore fork_done;
+// 	bool success;
+// };
 
 /* Starts the first userland program, called "initd", loaded from FILE_NAME.
  * The new thread may be scheduled (and may even exit)
@@ -95,11 +108,27 @@ initd(void *f_name)
 
 /* Clones the current process as `name`. Returns the new process's thread id, or
  * TID_ERROR if the thread cannot be created. */
-tid_t process_fork(const char *name, struct intr_frame *if_ UNUSED)
+tid_t process_fork(const char *name, struct intr_frame *if_)
 {
-	/* Clone current thread to new thread.*/
-	return thread_create(name,
-						 PRI_DEFAULT, __do_fork, thread_current());
+	struct fork_aux *aux = malloc(sizeof *aux);
+
+	aux->parent_if = *if_;
+	sema_init(&aux->fork_sema, 0);
+	aux->success = false;
+
+	tid_t tid = thread_create(name, PRI_DEFAULT, __do_fork, aux);
+
+	if (tid == TID_ERROR)
+	{
+		free(aux);
+		return TID_ERROR;
+	}
+
+	sema_down(&aux->fork_sema);
+	bool is_success = aux->success;
+	free(aux);
+
+	return is_success ? tid : TID_ERROR;
 }
 
 #ifndef VM
@@ -108,78 +137,136 @@ tid_t process_fork(const char *name, struct intr_frame *if_ UNUSED)
 static bool
 duplicate_pte(uint64_t *pte, void *va, void *aux)
 {
-	struct thread *current = thread_current();
-	struct thread *parent = (struct thread *)aux;
-	void *parent_page;
-	void *newpage;
-	bool writable;
-
 	/* 1. TODO: If the parent_page is kernel page, then return immediately. */
+	if (is_kern_pte(pte))
+	{
+		return true;
+	}
 
 	/* 2. Resolve VA from the parent's page map level 4. */
-	parent_page = pml4_get_page(parent->pml4, va);
+	struct thread *curr = thread_current();
+	struct thread *parent = (struct thread *)aux;
+	void *parent_page = pml4_get_page(parent->pml4, va);
+	if (!parent_page)
+	{
+		return false;
+	}
 
 	/* 3. TODO: Allocate new PAL_USER page for the child and set result to
 	 *    TODO: NEWPAGE. */
+	void *newpage = palloc_get_page(PAL_USER);
+	if (!newpage)
+	{
+		return false;
+	}
 
 	/* 4. TODO: Duplicate parent's page to the new page and
 	 *    TODO: check whether parent's page is writable or not (set WRITABLE
 	 *    TODO: according to the result). */
+	memcpy(newpage, parent_page, PGSIZE);
+	bool writable = is_writable(pte);
 
 	/* 5. Add new page to child's page table at address VA with WRITABLE
 	 *    permission. */
-	if (!pml4_set_page(current->pml4, va, newpage, writable))
+	if (!pml4_set_page(curr->pml4, va, newpage, writable))
 	{
 		/* 6. TODO: if fail to insert page, do error handling. */
+		palloc_free_page(newpage);
+		return false;
 	}
+
 	return true;
 }
 #endif
+
+static bool cleanup_cb(uint64_t *pte, void *va, void *aux)
+{
+	if (is_kern_pte(pte))
+	{
+		return false;
+	}
+
+	struct thread *curr = thread_current();
+	void *kpage = pml4_get_page(curr->pml4, va);
+	if (!kpage)
+	{
+		return false;
+	}
+
+	pml4_clear_page(curr->pml4, va);
+	palloc_free_page(kpage);
+
+	return true;
+}
 
 /* A thread function that copies parent's execution context.
  * Hint) parent->tf does not hold the userland context of the process.
  *       That is, you are required to pass second argument of process_fork to
  *       this function. */
 static void
-__do_fork(void *aux)
+__do_fork(void *aux_)
 {
-	struct intr_frame if_;
-	struct thread *parent = (struct thread *)aux;
-	struct thread *current = thread_current();
-	/* TODO: somehow pass the parent_if. (i.e. process_fork()'s if_) */
-	struct intr_frame *parent_if;
-	bool succ = true;
-
-	/* 1. Read the cpu context to local stack. */
-	memcpy(&if_, parent_if, sizeof(struct intr_frame));
+	struct fork_aux *aux = aux_;
+	struct intr_frame if_ = aux->parent_if;
+	struct thread *curr = thread_current();
+	struct thread *parent = curr->parent;
 
 	/* 2. Duplicate PT */
-	current->pml4 = pml4_create();
-	if (current->pml4 == NULL)
+	curr->pml4 = pml4_create();
+	if (curr->pml4 == NULL)
 		goto error;
 
-	process_activate(current);
+	process_activate(curr);
 #ifdef VM
-	supplemental_page_table_init(&current->spt);
-	if (!supplemental_page_table_copy(&current->spt, &parent->spt))
+	supplemental_page_table_init(&curr->spt);
+	if (!supplemental_page_table_copy(&curr->spt, &parent->spt))
 		goto error;
 #else
 	if (!pml4_for_each(parent->pml4, duplicate_pte, parent))
 		goto error;
 #endif
 
-	/* TODO: Your code goes here.
-	 * TODO: Hint) To duplicate the file object, use `file_duplicate`
-	 * TODO:       in include/filesys/file.h. Note that parent should not return
-	 * TODO:       from the fork() until this function successfully duplicates
-	 * TODO:       the resources of parent.*/
+	curr->fd_table[0] = parent->fd_table[0];
+	curr->fd_table[1] = parent->fd_table[1];
+	for (int i = 2; i < FD_MAX; i++)
+	{
+		if (parent->fd_table[i])
+		{
+			struct file *dup = file_duplicate(parent->fd_table[i]);
+			if (!dup)
+			{
+				goto error;
+			}
+			curr->fd_table[i] = dup;
+		}
+	}
+	curr->fd_next = parent->fd_next;
+	if (parent->exec_file)
+	{
+		curr->exec_file = file_duplicate(parent->exec_file);
+		if (!curr->exec_file)
+		{
+			goto error;
+		}
+	}
 
-	process_init();
+	// process_init();
 
-	/* Finally, switch to the newly created process. */
-	if (succ)
-		do_iret(&if_);
+	aux->success = true;
+	sema_up(&aux->fork_sema);
+	if_.R.rax = 0;
+	do_iret(&if_);
+
 error:
+	aux->success = false;
+	sema_up(&aux->fork_sema);
+	pml4_for_each(curr->pml4, cleanup_cb, curr);
+	fd_close_all();
+	if (curr->exec_file)
+	{
+		file_close(curr->exec_file);
+	}
+	pml4_destroy(curr->pml4);
 	thread_exit();
 }
 
@@ -275,7 +362,6 @@ void process_exit(void)
 
 		// 2. 보고서에 최종 상태를 기록한다.
 		cs->exit_status = curr->exit_status;
-		cs->dead = true;
 
 		// 자식의 참조 카운트를 1 감소시킨다.
 		cs->refer_cnt--;

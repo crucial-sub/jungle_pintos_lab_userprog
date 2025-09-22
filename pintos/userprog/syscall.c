@@ -22,6 +22,7 @@ void syscall_handler(struct intr_frame *);
 static void sys_wait(struct intr_frame *f);
 static void sys_exit(struct intr_frame *f);
 static void sys_exec(struct intr_frame *f);
+static tid_t sys_fork(struct intr_frame *f);
 static void sys_write(struct intr_frame *f);
 static void sys_create(struct intr_frame *f);
 static void sys_remove(struct intr_frame *f);
@@ -282,7 +283,7 @@ typedef void (*syscall_handler_t)(struct intr_frame *f); // 함수 포인터 형
 static const syscall_handler_t syscall_tbl[] = {
 	NULL,		  // SYS_HALT
 	sys_exit,	  // SYS_EXIT
-	NULL,		  // SYS_FORK
+	sys_fork,	  // SYS_FORK
 	sys_exec,	  // SYS_EXEC
 	sys_wait,	  // SYS_WAIT
 	sys_create,	  // SYS_CREATE
@@ -348,14 +349,28 @@ static void sys_exec(struct intr_frame *f)
 	}
 }
 
+static tid_t
+sys_fork(struct intr_frame *f)
+{
+	struct thread *curr = thread_current();
+	const char *thread_name = f->R.rdi;
+	bool too_long = false;
+	char *thread_name_k = copy_in_string_k(thread_name, PGSIZE, &too_long);
+	if (thread_name_k == NULL || too_long)
+	{
+		curr->exit_status = -1;
+		thread_exit();
+	}
+
+	f->R.rax = process_fork(thread_name_k, f);
+}
+
 static void sys_create(struct intr_frame *f)
 {
 	const char *file_u = (const char *)f->R.rdi;
 	unsigned size = (unsigned)f->R.rsi;
-
 	bool too_long = false;
 
-	char *buf;
 	char *name_k = copy_in_string_k(file_u, NAME_MAX, &too_long);
 
 	if (too_long)

@@ -146,7 +146,6 @@ struct child_status
 	tid_t tid;					 // 자식 tid
 	int exit_status;			 // 자식 exit status
 	int refer_cnt;				 // 참조 카운트(부모 1 + 자식 1 = 초기값 2)
-	bool dead;					 // 자식 종료 여부
 	struct semaphore sema;		 // 자식 종료 시 sema_up으로 부모를 깨움, 부모는 여기서 down
 	struct list_elem child_elem; // 부모의 children 리스트에 들어갈 노드
 };
