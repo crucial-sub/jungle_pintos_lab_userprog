@@ -56,7 +56,7 @@ char *copy_in_string_k(const char *ustr, size_t maxlen, bool *too_long);
 /* 유저 포인터 검증 실패를 즉시 종료로 처리해야 커널이 안전하며 테스트 요구사항을 만족한다.
  * => exit_bad_user(): 해당 프로세스만 깔끔하게 종료시키는 함수 */
 // __attribute__((noreturn)): 이 함수는 절대 리턴하지 않는다고 컴파일러에 선언
-static __attribute__((noreturn)) void
+__attribute__((noreturn)) void
 exit_bad_user(void)
 {
 	struct thread *t = thread_current();
