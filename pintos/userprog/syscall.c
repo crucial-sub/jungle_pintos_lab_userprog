@@ -19,6 +19,7 @@
 
 void syscall_entry(void);
 void syscall_handler(struct intr_frame *);
+static void sys_halt(struct intr_frame *f);
 static void sys_wait(struct intr_frame *f);
 static void sys_exit(struct intr_frame *f);
 static void sys_exec(struct intr_frame *f);
@@ -169,7 +170,10 @@ static void safe_copy_from_user(void *kernel_dest, const char *user_src, size_t 
 char *copy_in_string_k(const char *ustr, size_t maxlen, bool *too_long)
 {
 	char *kbuf = malloc(maxlen + 1); // +1 for NUL
-	ASSERT(kbuf != NULL);
+	if (kbuf == NULL)
+	{
+		return NULL;
+	}
 
 	size_t i = 0;
 	bool found_nul = false;
@@ -281,7 +285,7 @@ void syscall_init(void)
 typedef void (*syscall_handler_t)(struct intr_frame *f); // 함수 포인터 형 재선언
 
 static const syscall_handler_t syscall_tbl[] = {
-	NULL,		  // SYS_HALT
+	sys_halt,	  // SYS_HALT
 	sys_exit,	  // SYS_EXIT
 	sys_fork,	  // SYS_FORK
 	sys_exec,	  // SYS_EXEC
@@ -313,6 +317,11 @@ static void sys_exit(struct intr_frame *f)
  * 따라서 시스템 콜 핸들러인 syscall_handler()가 제어권을 넘겨받으면, 시스템 콜 번호는 rax에 있고,
  * 인자들은 %rdi, %rsi, %rdx, %r10, %r8, %r9 순서로 전달됨 (6개 이상 부터는 스택에 저장)`
  */
+static void sys_halt(struct intr_frame *f)
+{
+	power_off();
+}
+
 static void sys_badcall(struct intr_frame *f)
 {
 	f->R.rdi = (uint64_t)-1;
@@ -329,40 +338,59 @@ static void sys_exec(struct intr_frame *f)
 {
 	struct thread *curr = thread_current();
 	const char *cmd_line_u = (const char *)f->R.rdi;
+
 	bool too_long = false;
 	char *cmd_line_k = copy_in_string_k(cmd_line_u, PGSIZE, &too_long);
 	if (cmd_line_k == NULL || too_long)
 	{
+		if (cmd_line_k)
+		{
+			free(cmd_line_k); // 누수 방지
+		}
 		curr->exit_status = -1;
-		thread_exit();
+		thread_exit(); // exec 실패 규약
 	}
 
 	char *fn_copy = palloc_get_page(0);
+	if (fn_copy == NULL)
+	{
+		free(cmd_line_k);
+		curr->exit_status = -1;
+		thread_exit(); // 커널 OOM도 실패로 종료
+	}
+
 	strlcpy(fn_copy, cmd_line_k, PGSIZE);
 	free(cmd_line_k);
 
 	int res = process_exec(fn_copy);
-	if (res == -1)
-	{
-		curr->exit_status = -1;
-		thread_exit();
-	}
+	// 성공 시 process_exec는 복귀하지 않는다.
+	// 복귀했다 = 실패: 임시 페이지 회수 후 -1로 종료
+	curr->exit_status = -1;
+	thread_exit();
 }
 
 static tid_t
 sys_fork(struct intr_frame *f)
 {
-	struct thread *curr = thread_current();
-	const char *thread_name = f->R.rdi;
+	const char *uname = (const char *)f->R.rdi;
 	bool too_long = false;
-	char *thread_name_k = copy_in_string_k(thread_name, PGSIZE, &too_long);
-	if (thread_name_k == NULL || too_long)
-	{
-		curr->exit_status = -1;
-		thread_exit();
+	char *kname = copy_in_string_k(uname, PGSIZE, &too_long);
+
+	if (kname == NULL)
+	{ // 커널 OOM: 실패를 값으로
+		f->R.rax = TID_ERROR;
+		return;
+	}
+	if (too_long)
+	{ // 이름이 지나치게 길면 실패 처리(커널은 안전)
+		free(kname);
+		f->R.rax = TID_ERROR;
+		return;
 	}
 
-	f->R.rax = process_fork(thread_name_k, f);
+	tid_t tid = process_fork(kname, f); // process_fork 내부에서 자식 성공/실패 확정 후 sema_up
+	free(kname);						// 누수 방지
+	f->R.rax = tid;						// 성공: pid, 실패: TID_ERROR
 }
 
 static void sys_create(struct intr_frame *f)
@@ -373,19 +401,14 @@ static void sys_create(struct intr_frame *f)
 
 	char *name_k = copy_in_string_k(file_u, NAME_MAX, &too_long);
 
-	if (too_long)
+	if (name_k == NULL || too_long || name_k[0] == '\0')
 	{
+		if (name_k)
+			free(name_k);
 		f->R.rax = false;
+		return;
 	}
-	else if (name_k[0] == '\0')
-	{
-		f->R.rax = false;
-	}
-	else
-	{
-		f->R.rax = filesys_create(name_k, size);
-	}
-
+	f->R.rax = filesys_create(name_k, size);
 	free(name_k);
 }
 
@@ -395,19 +418,14 @@ static void sys_remove(struct intr_frame *f)
 	bool too_long = false;
 	char *name_k = copy_in_string_k(file_u, NAME_MAX, &too_long);
 
-	if (too_long)
+	if (name_k == NULL || too_long || name_k[0] == '\0')
 	{
+		if (name_k)
+			free(name_k);
 		f->R.rax = false;
+		return;
 	}
-	else if (name_k[0] == '\0')
-	{
-		f->R.rax = false;
-	}
-	else
-	{
-		f->R.rax = filesys_remove(name_k);
-	}
-
+	f->R.rax = filesys_remove(name_k);
 	free(name_k);
 }
 
@@ -417,28 +435,36 @@ static void sys_open(struct intr_frame *f)
 	bool too_long = false;
 	char *name_k = copy_in_string_k(file_u, NAME_MAX, &too_long);
 
-	if (too_long)
+	if (name_k == NULL || too_long || name_k[0] == '\0')
 	{
-		f->R.rax = -1;
-	}
-	else if (name_k[0] == '\0')
-	{
-		f->R.rax = -1;
-	}
-	else
-	{
-		struct file *file = filesys_open(name_k);
-		if (file == NULL)
+		if (name_k)
 		{
-			f->R.rax = -1;
+			free(name_k);
 		}
-		else
-		{
-			f->R.rax = fd_allocate(file);
-		}
+		f->R.rax = -1;
+		return;
+	}
+
+	struct file *file = filesys_open(name_k);
+	if (file == NULL)
+	{
+		free(name_k);
+		f->R.rax = -1;
+		return;
+	}
+
+	int fd = fd_allocate(file);
+	if (fd < 0)
+	{
+		/* 여기서 반드시 되돌리기! */
+		file_close(file);
+		free(name_k);
+		f->R.rax = -1;
+		return;
 	}
 
 	free(name_k);
+	f->R.rax = fd;
 }
 
 static void sys_close(struct intr_frame *f)

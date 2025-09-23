@@ -30,7 +30,7 @@ typedef int tid_t;
 #define PRI_MAX 63	   /* Highest priority. */
 
 struct file;
-#define FD_MAX 16
+#define FD_MAX 32
 
 /* A kernel thread or user process.
  *

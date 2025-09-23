@@ -123,7 +123,6 @@ tid_t process_fork(const char *name, struct intr_frame *if_)
 		free(aux);
 		return TID_ERROR;
 	}
-
 	sema_down(&aux->fork_sema);
 	bool is_success = aux->success;
 	free(aux);
@@ -256,17 +255,21 @@ __do_fork(void *aux_)
 	sema_up(&aux->fork_sema);
 	if_.R.rax = 0;
 	do_iret(&if_);
-
 error:
 	aux->success = false;
 	sema_up(&aux->fork_sema);
-	pml4_for_each(curr->pml4, cleanup_cb, curr);
+	if (curr->pml4 != NULL)
+	{
+		pml4_activate(parent->pml4);
+		uint64_t *old = curr->pml4;
+		curr->pml4 = NULL;
+		pml4_destroy(old);
+	}
 	fd_close_all();
 	if (curr->exec_file)
 	{
 		file_close(curr->exec_file);
 	}
-	pml4_destroy(curr->pml4);
 	thread_exit();
 }
 
@@ -400,6 +403,7 @@ process_cleanup(void)
 
 	if (curr->exec_file != NULL)
 	{
+		// 실행 파일만 정리하고 fd테이블은 정리x
 		file_close(curr->exec_file);
 		curr->exec_file = NULL;
 	}
